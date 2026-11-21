@@ -9,11 +9,15 @@ import importlib.abc
 import importlib.util
 import json
 import os
-import resource
-import select
 import signal
 import sys
 import time
+
+try:
+    import resource
+    import select
+except ImportError:  # Windows (local development only): children run as subprocesses
+    resource = select = None
 
 _PRELOADED = set()
 
@@ -217,8 +221,51 @@ def _child(root, patched, nodeids, wfd):
         os._exit(0)
 
 
+def _sub_main():
+    """Windows development stand-in for a forked child: args as JSON on stdin."""
+    a = json.loads(sys.stdin.read())
+    wfd = os.dup(1)
+    t0 = time.process_time()
+    real_exit = os._exit
+
+    def ex(code):
+        os.write(wfd, (chr(10) + json.dumps({"cpu": time.process_time() - t0})).encode())
+        real_exit(code)
+
+    os._exit = ex
+    if a["kind"] == "run":
+        _child(a["root"], a["patched"], a["nodeids"], wfd)
+    else:
+        _snap_child(a["root"], a["patched"], wfd)
+
+
+def _sub(kind, root, patched, nodeids, timeout):
+    import subprocess
+
+    args = json.dumps({"kind": kind, "root": root, "patched": patched, "nodeids": nodeids})
+    try:
+        p = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import verify; verify._sub_main()"
+                            % os.path.dirname(os.path.abspath(__file__))],
+                           input=args.encode(), capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, timeout, "timeout"
+    out = p.stdout.decode()
+    body, _, tail = out.rpartition(chr(10))
+    try:
+        cpu = json.loads(tail)["cpu"]
+        res = json.loads(body)
+    except Exception:
+        return None, 0.0, "no result " + p.stderr.decode()[-300:]
+    return res, cpu, ""
+
+
 def run(root, patched, nodeids, timeout):
     """Returns (set of node ids that did not pass, child cpu seconds) or (None, cpu) on any doubt."""
+    if not hasattr(os, "fork"):
+        res, cpu, err = _sub("run", root, patched, nodeids, timeout)
+        if res is None or "error" in res:
+            return None, cpu, err or res["error"]
+        return set(res["bad"]), cpu, ""
     sys.stdout.flush()
     sys.stderr.flush()
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -408,6 +455,9 @@ def _snap_child(root, patched, wfd):
 
 def snapshot(root, patched, timeout=20):
     """Definition-time state of every sqlglot module, as {key: digest}, or None."""
+    if not hasattr(os, "fork"):
+        res, cpu, err = _sub("snap", root, patched, [], timeout)
+        return (None if res is None else res.get("snap")), cpu
     sys.stdout.flush()
     sys.stderr.flush()
     before = resource.getrusage(resource.RUSAGE_CHILDREN)

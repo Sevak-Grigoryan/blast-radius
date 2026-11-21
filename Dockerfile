@@ -4,7 +4,7 @@ WORKDIR /app
 # the exact packages sqlglot's tests were labeled with, so the selector can run tests itself
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.lock
-COPY src.tar.gz selector.py verify.py map.json.gz implines.json.gz vcost.json /app/
+COPY src.tar.gz selector.py verify.py map.json.gz implines.json.gz vcost.json typemap.json.gz /app/
 # sqlglot and its tests at the pinned commit (git archive of eb11aec), byte-compiled ahead
 RUN python -c "import tarfile; tarfile.open('/app/src.tar.gz').extractall('/app/sqlglot', filter='data')" \
  && rm /app/src.tar.gz && test -f /app/sqlglot/sqlglot/parser.py \

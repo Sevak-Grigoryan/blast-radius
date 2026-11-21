@@ -39,6 +39,11 @@ try:
 except Exception:
     IMPLINES = None  # unknown: every function line could run at import time
 INFO = {}
+try:
+    _TM = json.loads(gzip.open(HERE / "typemap.json.gz").read())
+    TYPEMAP = {"types": _TM["types"], "sites": _TM["sites"]}
+except Exception:
+    TYPEMAP = None  # no operand-type map: never treat an `is` / `==` swap as a no-op
 
 
 def log(*a):
@@ -177,6 +182,81 @@ def changed_lines_py(old_src, new_src):
             if i1 < len(a):
                 res.add(a[i1][2])
     return res
+
+
+# ------------------------------------------------------------------ identity / equality swaps
+_SWAP = {ast.Is: ast.Eq, ast.IsNot: ast.NotEq}
+
+
+def _canon_dump(tree):
+    """ast dump with `is` read as `==` and `is not` as `!=` in single-operator comparisons."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _SWAP:
+            node.ops = [_SWAP[type(node.ops[0])]()]
+    return ast.dump(tree, include_attributes=False)
+
+
+# Classes whose __eq__ is `self is other or (type(self) is type(other) and ...)` with no side effect
+# before the type test, and whose __ne__ is `not __eq__`: against an operand of another type they
+# compare by identity. (sqlglot/expressions/core.py, Expression.__eq__ / __ne__ at the pinned commit.)
+TYPED_EQ = {"sqlglot.expressions.core.Expression"}
+TYPED_OK = [True]  # off when the patch itself edits those methods' file
+
+
+def _eq_kind(t):
+    if t[1]:
+        return "id"
+    if len(t) > 5 and t[4] in TYPED_EQ and t[5] in TYPED_EQ and TYPED_OK[0]:
+        return "typed"
+    return "other"
+
+
+def _same_under_identity(a, b):
+    """`x is y` and `x == y` (and their negations) give the same result for these operand types:
+    both compare by identity (no __eq__ / __ne__ of their own, or None), or both are members of the
+    same enum (singletons with unique values), or both are bools, or they are different types each
+    of which compares by identity or with Expression.__eq__ (identity across types)."""
+    ta, tb = TYPEMAP["types"][a], TYPEMAP["types"][b]
+    ka, kb = _eq_kind(ta), _eq_kind(tb)
+    if ka == "id" and kb == "id":
+        return True
+    if a == b:
+        return bool(ta[2] or ta[3])
+    return ka != "other" and kb != "other"
+
+
+def identity_swap_noop(rel, old_src, new_src):
+    """True when the only code change swaps `is` <-> `==` or `is not` <-> `!=`, at comparisons the
+    pinned test suite reached only with operand types for which both spellings agree."""
+    if TYPEMAP is None:
+        return False
+    try:
+        old_t, new_t = ast.parse(old_src), ast.parse(new_src)
+    except SyntaxError:
+        return False
+    old_nodes, new_nodes = list(ast.walk(old_t)), list(ast.walk(new_t))
+    if len(old_nodes) != len(new_nodes):
+        return False
+    sites = []
+    for o, n in zip(old_nodes, new_nodes):
+        if type(o) is not type(n):
+            if isinstance(o, ast.cmpop) and isinstance(n, ast.cmpop):
+                continue  # the operators themselves; the canonical dump below checks the pairing
+            return False
+        if isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1 and type(o.ops[0]) is not type(n.ops[0]):
+            sites.append(f"{rel}:{o.lineno}:{o.col_offset}")
+    if not sites:
+        return False
+    if _canon_dump(old_t) != _canon_dump(new_t):
+        return False
+    for s in sites:
+        pairs = TYPEMAP["sites"].get(s)
+        if not pairs:
+            return False  # never reached while mapping: no evidence either way
+        if not all(_same_under_identity(a, b) for a, b in pairs):
+            return False
+    log(f"{rel}: identity/equality swap at {sites}: same result for every observed operand type")
+    return True
 
 
 # ------------------------------------------------------------------ line -> tests
@@ -375,7 +455,9 @@ def select(patch_text):
     INFO.clear()
     INFO["defs"] = set()      # files whose import-time function lines changed
     INFO["py"] = {}           # patched sqlglot sources
-    for f in parse_patch(patch_text):
+    files = parse_patch(patch_text)
+    TYPED_OK[0] = not any((f["old"] or f["new"]) == "sqlglot/expressions/core.py" for f in files)
+    for f in files:
         rel = f["old"] or f["new"]
         new_rel = f["new"]
         if rel is None:
@@ -414,6 +496,8 @@ def select(patch_text):
                 lines = changed_lines_naive(f["hunks"])
             if not lines:
                 continue  # only comments / blank lines changed
+            if rel.startswith("sqlglot/") and identity_swap_noop(rel, old_src, new_src):
+                continue
             sel |= tests_for_py_lines(rel, old_src, lines)
             if rel.startswith("sqlglot/"):
                 INFO["py"][rel] = new_src
@@ -478,6 +562,7 @@ def load_numbering():
 # coverage set is cheap to run, run it against the patched code: if nothing fails the commit
 # needs no worker at all, and if something fails only the failing tests are kept.
 P_PASS = 0.5          # chance that a coverage set of a code change has no failing test
+CPU_SCALE = 0.8       # measured check CPU relative to estimate_cpu (it overestimates)
 CPU_BUDGET = 40.0     # seconds of child CPU for the whole batch
 WALL_BUDGET = 75.0    # seconds since start after which no new check starts
 T0 = None
@@ -570,7 +655,9 @@ def check_runs(plans):
             continue
         cost = split_cost(split(sel)) / 1000
         est = estimate_cpu(sel, vcost)
-        if P_PASS * cost > est:
+        # expected cost with the check: its CPU, plus (if something fails) a worker for the failures
+        residual = min(cost, WORKER_MS / 1000 + 0.5 + 0.25 * max(cost - WORKER_MS / 1000, 0))
+        if CPU_SCALE * est + (1 - P_PASS) * residual < cost:
             cands.append((cost - est, c, ids, est))
     if not cands:
         return
